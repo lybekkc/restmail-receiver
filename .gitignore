@@ -1,1 +1,12 @@
 /target
+
+# Local development directories
+dev-storage/
+dev-logs/
+
+# Environment variables (may contain sensitive data)
+.env
+
+# macOS
+.DS_Store
+

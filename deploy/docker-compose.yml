@@ -18,10 +18,14 @@ services:
       - "12345:12345"  # Policy service port
     volumes:
       - ./mail-storage:/var/mail/restmail
+      - ./logs:/var/log/restmail-receiver
     restart: unless-stopped
 
 # To use this file:
 # 1. docker-compose up -d
 # 2. docker-compose logs -f
 # 3. docker-compose down
+#
+# Logs are persisted to ./logs/ directory on the host
+# Mail storage is persisted to ./mail-storage/ directory on the host
 

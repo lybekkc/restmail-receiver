@@ -6,6 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use chrono::Local;
 use uuid::Uuid;
+use tracing::{info, warn, error, debug, instrument};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 #[derive(Deserialize, Clone)]
 struct Config {
@@ -26,8 +29,110 @@ struct StorageConfig {
     incoming: String,
 }
 
+fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
+    // Detect if running in a container or Kubernetes
+    let in_container = env::var("KUBERNETES_SERVICE_HOST").is_ok()
+        || env::var("DOCKER_CONTAINER").is_ok()
+        || Path::new("/.dockerenv").exists()
+        || env::var("RESTMAIL_LOG_MODE").as_deref() == Ok("stdout");
+
+    // Get log directory from environment or use default
+    let log_dir = env::var("RESTMAIL_LOG_DIR")
+        .unwrap_or_else(|_| "/var/log/restmail-receiver".to_string());
+
+    // Check if the log directory is writable (indicates a mounted volume)
+    let log_dir_writable = if in_container {
+        // Try to create the directory to see if it's writable
+        fs::create_dir_all(&log_dir).is_ok()
+            && fs::metadata(&log_dir).map(|m| !m.permissions().readonly()).unwrap_or(false)
+    } else {
+        true // Assume writable on bare-metal
+    };
+
+    // Set up env filter (default to info level)
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if in_container && !log_dir_writable {
+        // Container mode without volume mount: Log only to stdout
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stdout)
+                    .with_ansi(false)
+                    .with_target(false)
+            )
+            .init();
+
+        info!("Logger initialized in container mode (stdout only - no volume mounted)");
+    } else {
+        // Bare-metal mode OR container with mounted volume: Try to log to file + stdout
+        // Try to create log directory - if it fails, fall back to stdout only
+        match fs::create_dir_all(&log_dir) {
+            Ok(_) => {
+                // Directory created successfully, set up file + stdout logging
+                let file_appender = RollingFileAppender::new(
+                    Rotation::DAILY,
+                    &log_dir,
+                    "restmail.log"
+                );
+
+                let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+                // Set up the subscriber with both file and stdout
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_writer(non_blocking)
+                            .with_ansi(false)
+                            .with_target(false)
+                    )
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_writer(std::io::stdout)
+                            .with_target(false)
+                    )
+                    .init();
+
+                if in_container {
+                    info!("Logger initialized in container mode with volume mount, writing to: {}/restmail.log", log_dir);
+                } else {
+                    info!("Logger initialized in bare-metal mode, writing to: {}/restmail.log", log_dir);
+                }
+            },
+            Err(e) => {
+                // Failed to create log directory - fall back to stdout only
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_writer(std::io::stdout)
+                            .with_ansi(false)
+                            .with_target(false)
+                    )
+                    .init();
+
+                warn!("Failed to create log directory '{}': {} - falling back to stdout-only logging", log_dir, e);
+                info!("Logger initialized in stdout-only mode (log directory not writable)");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env file first (before logger initialization)
+    let _ = dotenv::dotenv();
+
+    // Initialize logger
+    init_logger()?;
+
+    info!("🚀 Starting Restmail Receiver");
+
     // 1. Last konfigurasjon
     let config = load_config();
     let addr = &config.network.listen_address;
@@ -35,6 +140,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Sett opp lyttere
     let policy_listener = TcpListener::bind(format!("{}:{}", addr, config.network.policy_port)).await?;
     let delivery_listener = TcpListener::bind(format!("{}:{}", addr, config.network.delivery_port)).await?;
+
+    info!("Policy Service listening on {}:{}", addr, config.network.policy_port);
+    info!("Mail Delivery listening on {}:{}", addr, config.network.delivery_port);
 
     println!("🚀 Restmail System Aktivt!");
     println!("🛡️ Policy Service på port {}", config.network.policy_port);
@@ -44,17 +152,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let conf = config.clone();
         tokio::select! {
             // Håndter Policy-sjekk (Postfix dørvakt)
-            Ok((socket, _)) = policy_listener.accept() => {
+            Ok((socket, addr)) = policy_listener.accept() => {
+                debug!("Policy connection from: {}", addr);
                 tokio::spawn(async move {
                     if let Err(e) = handle_policy(socket).await {
+                        error!("Policy handler error: {}", e);
                         eprintln!("Policy feil: {}", e);
                     }
                 });
             }
             // Håndter Mail-levering (Selve e-posten)
-            Ok((socket, _)) = delivery_listener.accept() => {
+            Ok((socket, addr)) = delivery_listener.accept() => {
+                debug!("Mail delivery connection from: {}", addr);
                 tokio::spawn(async move {
                     if let Err(e) = handle_mail_delivery(socket, conf).await {
+                        error!("Mail delivery handler error: {}", e);
                         eprintln!("Delivery feil: {}", e);
                     }
                 });
@@ -64,8 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn load_config() -> Config {
-    // Try to load .env file if it exists (useful for development)
-    let _ = dotenv::dotenv();
+    // Note: .env file is loaded in main() before this function is called
 
     // Check if environment variables are set
     let env_policy_port = env::var("RESTMAIL_POLICY_PORT").ok();
@@ -78,6 +189,7 @@ fn load_config() -> Config {
     if env_policy_port.is_some() && env_delivery_port.is_some() && env_listen_address.is_some()
         && env_base_path.is_some() && env_incoming.is_some() {
 
+        info!("Loading configuration from environment variables");
         println!("📌 Laster konfigurasjon fra miljøvariabler");
 
         Config {
@@ -96,6 +208,7 @@ fn load_config() -> Config {
         let config_path = env::var("RESTMAIL_CONFIG_PATH")
             .unwrap_or_else(|_| "/etc/restmail-receiver/config.toml".to_string());
 
+        info!("Loading configuration from file: {}", config_path);
         println!("📌 Laster konfigurasjon fra fil: {}", config_path);
 
         let content = fs::read_to_string(&config_path)
@@ -125,6 +238,7 @@ fn load_config() -> Config {
 }
 
 // --- PORT 12345: POLICY SERVICE ---
+#[instrument(skip(socket))]
 async fn handle_policy(socket: TcpStream) -> std::io::Result<()> {
     let mut reader = BufReader::new(socket);
     let mut line = String::new();
@@ -134,8 +248,10 @@ async fn handle_policy(socket: TcpStream) -> std::io::Result<()> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             let response = if recipient.ends_with("@restmail.org") {
+                info!("Policy check: ACCEPTED for recipient: {}", recipient);
                 "action=OK\n\n"
             } else {
+                warn!("Policy check: REJECTED for recipient: {}", recipient);
                 "action=REJECT Domene ikke støttet\n\n"
             };
             // Skriv via reader.get_mut()
@@ -152,15 +268,19 @@ async fn handle_policy(socket: TcpStream) -> std::io::Result<()> {
 }
 
 // --- PORT 2525: SMTP DELIVERY ---
-async fn handle_mail_delivery(mut socket: TcpStream, config: Config) -> std::io::Result<()> {
+#[instrument(skip(socket, config))]
+async fn handle_mail_delivery(socket: TcpStream, config: Config) -> std::io::Result<()> {
     // Vi flytter socket inn i BufReader med en gang
     let mut reader = BufReader::new(socket); 
     let mut line = String::new();
     let mut email_data = String::new();
     let mut in_data_mode = false;
+    let mut mail_from = String::new();
+    let mut rcpt_to = String::new();
 
     // Bruk reader.get_mut() for å skrive
     reader.get_mut().write_all(b"220 localhost ESMTP Restmail-Receiver\r\n").await?;
+    debug!("SMTP session started");
 
     loop {
         line.clear();
@@ -169,56 +289,67 @@ async fn handle_mail_delivery(mut socket: TcpStream, config: Config) -> std::io:
 
         if in_data_mode {
             if trimmed == "." {
-                // Finn dette partiet inne i DATA-håndteringen i handle_mail_delivery:
-if trimmed == "." {
-    let id = Uuid::new_v4();
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let file_name = format!("{}_{}.eml", timestamp, id);
+                let id = Uuid::new_v4();
+                let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+                let file_name = format!("{}_{}.eml", timestamp, id);
 
-    // SLÅ SAMMEN STIER: f.eks. "/var/mail/restmail" + "incoming"
-    let full_path = Path::new(&config.storage.base_path).join(&config.storage.incoming);
-    let file_path = full_path.join(file_name);
+                // SLÅ SAMMEN STIER: f.eks. "/var/mail/restmail" + "incoming"
+                let full_path = Path::new(&config.storage.base_path).join(&config.storage.incoming);
+                let file_path = full_path.join(file_name);
 
-    // Sørg for at hele stien eksisterer
-    if let Err(e) = fs::create_dir_all(&full_path) {
-        eprintln!("❌ Feil ved opprettelse av mappe {:?}: {}", full_path, e);
-    }
+                // Sørg for at hele stien eksisterer
+                if let Err(e) = fs::create_dir_all(&full_path) {
+                    error!("Failed to create directory {:?}: {}", full_path, e);
+                    eprintln!("❌ Feil ved opprettelse av mappe {:?}: {}", full_path, e);
+                }
 
-    match tokio::fs::write(&file_path, &email_data).await {
-        Ok(_) => {
-            println!("📧 Mail suksessfullt lagret i: {:?}", file_path);
-            reader.get_mut().write_all(b"250 2.0.0 Ok: Queued\r\n").await?;
-        },
-        Err(e) => {
-            eprintln!("❌ Kunne ikke skrive fil til {:?}: {}", file_path, e);
-            reader.get_mut().write_all(b"451 4.3.0 Error: Could not write file\r\n").await?;
-        }
-    }
+                match tokio::fs::write(&file_path, &email_data).await {
+                    Ok(_) => {
+                        info!("Mail saved successfully: from={}, to={}, file={:?}", mail_from, rcpt_to, file_path);
+                        println!("📧 Mail suksessfullt lagret i: {:?}", file_path);
+                        reader.get_mut().write_all(b"250 2.0.0 Ok: Queued\r\n").await?;
+                    },
+                    Err(e) => {
+                        error!("Failed to write mail file {:?}: {}", file_path, e);
+                        eprintln!("❌ Kunne ikke skrive fil til {:?}: {}", file_path, e);
+                        reader.get_mut().write_all(b"451 4.3.0 Error: Could not write file\r\n").await?;
+                    }
+                }
 
-    in_data_mode = false;
-    email_data.clear();
-}
+                in_data_mode = false;
+                email_data.clear();
             } else {
                 email_data.push_str(&line);
             }
         } else {
             match trimmed.to_uppercase().as_str() {
                 t if t.starts_with("HELO") || t.starts_with("EHLO") => {
+                    debug!("SMTP command: {}", trimmed);
                     reader.get_mut().write_all(b"250 Hello\r\n").await?;
                 }
-                t if t.starts_with("MAIL FROM") || t.starts_with("RCPT TO") => {
+                t if t.starts_with("MAIL FROM") => {
+                    mail_from = trimmed.to_string();
+                    debug!("SMTP command: {}", trimmed);
+                    reader.get_mut().write_all(b"250 Ok\r\n").await?;
+                }
+                t if t.starts_with("RCPT TO") => {
+                    rcpt_to = trimmed.to_string();
+                    debug!("SMTP command: {}", trimmed);
                     reader.get_mut().write_all(b"250 Ok\r\n").await?;
                 }
                 "DATA" => {
+                    info!("Starting mail delivery: from={}, to={}", mail_from, rcpt_to);
                     in_data_mode = true;
                     reader.get_mut().write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n").await?;
                 }
                 "QUIT" => {
+                    debug!("SMTP session ended");
                     reader.get_mut().write_all(b"221 Bye\r\n").await?;
                     break;
                 }
                 _ => { 
-                    reader.get_mut().write_all(b"500 Unknown\r\n").await?; 
+                    warn!("Unknown SMTP command: {}", trimmed);
+                    reader.get_mut().write_all(b"500 Unknown\r\n").await?;
                 }
             }
         }

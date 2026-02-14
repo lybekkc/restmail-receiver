@@ -1,3 +1,33 @@
+# Kubernetes deployment with PersistentVolumeClaims for production
+# This configuration persists data across pod restarts and node failures
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: restmail-mail-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi  # Adjust based on expected mail volume
+  # storageClassName: standard  # Uncomment and set your storage class
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: restmail-logs-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi  # Adjust based on log retention needs
+  # storageClassName: standard  # Uncomment and set your storage class
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,7 +45,7 @@ spec:
       containers:
       - name: receiver
         image: restmail-receiver:latest
-        imagePullPolicy: Never # Viktig når vi bruker lokalt register
+        imagePullPolicy: Never # Change to IfNotPresent or Always for remote registry
         env:
         - name: RESTMAIL_POLICY_PORT
           value: "12345"
@@ -39,20 +69,11 @@ spec:
           mountPath: /var/log/restmail-receiver
       volumes:
       - name: mail-storage
-        hostPath:
-          path: /var/mail/restmail
-          type: DirectoryOrCreate
+        persistentVolumeClaim:
+          claimName: restmail-mail-pvc
       - name: log-storage
-        hostPath:
-          path: /var/log/restmail-receiver
-          type: DirectoryOrCreate
-        # For production with persistent storage, use PersistentVolumeClaim instead:
-        # - name: mail-storage
-        #   persistentVolumeClaim:
-        #     claimName: restmail-mail-pvc
-        # - name: log-storage
-        #   persistentVolumeClaim:
-        #     claimName: restmail-logs-pvc
+        persistentVolumeClaim:
+          claimName: restmail-logs-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -67,9 +88,10 @@ spec:
       protocol: TCP
       port: 2525
       targetPort: 2525
-      nodePort: 30025 # Denne må matche Postfix transport-filen
+      nodePort: 30025
     - name: policy
       protocol: TCP
       port: 12345
       targetPort: 12345
       nodePort: 30345
+

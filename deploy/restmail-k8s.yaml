@@ -16,8 +16,28 @@ spec:
       - name: receiver
         image: restmail-receiver:latest
         imagePullPolicy: Never # Viktig når vi bruker lokalt register
+        env:
+        - name: RESTMAIL_POLICY_PORT
+          value: "12345"
+        - name: RESTMAIL_DELIVERY_PORT
+          value: "2525"
+        - name: RESTMAIL_LISTEN_ADDRESS
+          value: "0.0.0.0"
+        - name: RESTMAIL_STORAGE_BASE_PATH
+          value: "/var/mail/restmail"
+        - name: RESTMAIL_STORAGE_INCOMING
+          value: "incoming"
         ports:
         - containerPort: 2525
+          name: delivery
+        - containerPort: 12345
+          name: policy
+        volumeMounts:
+        - name: mail-storage
+          mountPath: /var/mail/restmail
+      volumes:
+      - name: mail-storage
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -28,7 +48,13 @@ spec:
   selector:
     app: restmail-receiver
   ports:
-    - protocol: TCP
+    - name: delivery
+      protocol: TCP
       port: 2525
       targetPort: 2525
       nodePort: 30025 # Denne må matche Postfix transport-filen
+    - name: policy
+      protocol: TCP
+      port: 12345
+      targetPort: 12345
+      nodePort: 30345

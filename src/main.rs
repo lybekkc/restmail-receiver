@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
+use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use chrono::Local;
@@ -63,10 +64,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn load_config() -> Config {
-    let path = "/etc/restmail-receiver/config.toml";
-    let content = fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("Kunne ikke lese {}", path));
-    toml::from_str(&content).expect("Feil i TOML-format")
+    // Try to load .env file if it exists (useful for development)
+    let _ = dotenv::dotenv();
+
+    // Check if environment variables are set
+    let env_policy_port = env::var("RESTMAIL_POLICY_PORT").ok();
+    let env_delivery_port = env::var("RESTMAIL_DELIVERY_PORT").ok();
+    let env_listen_address = env::var("RESTMAIL_LISTEN_ADDRESS").ok();
+    let env_base_path = env::var("RESTMAIL_STORAGE_BASE_PATH").ok();
+    let env_incoming = env::var("RESTMAIL_STORAGE_INCOMING").ok();
+
+    // If all required environment variables are set, use them
+    if env_policy_port.is_some() && env_delivery_port.is_some() && env_listen_address.is_some()
+        && env_base_path.is_some() && env_incoming.is_some() {
+
+        println!("📌 Laster konfigurasjon fra miljøvariabler");
+
+        Config {
+            network: NetworkConfig {
+                policy_port: env_policy_port.unwrap().parse().expect("RESTMAIL_POLICY_PORT må være et gyldig tall"),
+                delivery_port: env_delivery_port.unwrap().parse().expect("RESTMAIL_DELIVERY_PORT må være et gyldig tall"),
+                listen_address: env_listen_address.unwrap(),
+            },
+            storage: StorageConfig {
+                base_path: env_base_path.unwrap(),
+                incoming: env_incoming.unwrap(),
+            },
+        }
+    } else {
+        // Fall back to config file
+        let config_path = env::var("RESTMAIL_CONFIG_PATH")
+            .unwrap_or_else(|_| "/etc/restmail-receiver/config.toml".to_string());
+
+        println!("📌 Laster konfigurasjon fra fil: {}", config_path);
+
+        let content = fs::read_to_string(&config_path)
+            .unwrap_or_else(|_| panic!("Kunne ikke lese {}", config_path));
+
+        let mut config: Config = toml::from_str(&content).expect("Feil i TOML-format");
+
+        // Allow environment variables to override individual config file values
+        if let Ok(port) = env::var("RESTMAIL_POLICY_PORT") {
+            config.network.policy_port = port.parse().expect("RESTMAIL_POLICY_PORT må være et gyldig tall");
+        }
+        if let Ok(port) = env::var("RESTMAIL_DELIVERY_PORT") {
+            config.network.delivery_port = port.parse().expect("RESTMAIL_DELIVERY_PORT må være et gyldig tall");
+        }
+        if let Ok(addr) = env::var("RESTMAIL_LISTEN_ADDRESS") {
+            config.network.listen_address = addr;
+        }
+        if let Ok(path) = env::var("RESTMAIL_STORAGE_BASE_PATH") {
+            config.storage.base_path = path;
+        }
+        if let Ok(incoming) = env::var("RESTMAIL_STORAGE_INCOMING") {
+            config.storage.incoming = incoming;
+        }
+
+        config
+    }
 }
 
 // --- PORT 12345: POLICY SERVICE ---

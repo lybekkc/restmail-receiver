@@ -43,6 +43,25 @@ echo "   ✅ Policy Port: $POLICY_PORT"
 echo "   ✅ Delivery Port: $DELIVERY_PORT"
 
 echo ""
+echo "2b. Checking storage configuration..."
+VOLUME_TYPE=$(kubectl get deployment restmail-receiver -o jsonpath='{.spec.template.spec.volumes[0]}')
+if echo "$VOLUME_TYPE" | grep -q "persistentVolumeClaim"; then
+    echo "   ✅ Using PVC (persistent storage)"
+    PVC_NAME=$(kubectl get deployment restmail-receiver -o jsonpath='{.spec.template.spec.volumes[0].persistentVolumeClaim.claimName}')
+    PVC_STATUS=$(kubectl get pvc "$PVC_NAME" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+    if [ "$PVC_STATUS" = "Bound" ]; then
+        echo "   ✅ PVC Status: Bound"
+    else
+        echo "   ⚠️  PVC Status: $PVC_STATUS"
+    fi
+elif echo "$VOLUME_TYPE" | grep -q "hostPath"; then
+    echo "   ⚠️  Using hostPath (not persistent!)"
+    echo "   📝 Consider migrating to PVC: ./migrate-to-pvc.sh"
+else
+    echo "   ❓ Unknown storage type"
+fi
+
+echo ""
 echo "3️⃣ Testing Policy Service (port $POLICY_PORT)..."
 POLICY_RESPONSE=$(timeout 5 bash -c "(echo 'request=smtpd_access_policy
 protocol_state=RCPT

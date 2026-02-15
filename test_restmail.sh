@@ -14,8 +14,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Default configuration
-POLICY_PORT=12345
-DELIVERY_PORT=2525
+POLICY_PORT=""
+DELIVERY_PORT=""
 HOST="localhost"
 MODE="local"
 

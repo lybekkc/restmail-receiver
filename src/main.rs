@@ -10,6 +10,12 @@ use tracing::{info, warn, error, debug, instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
+mod api_client;
+mod email_parser;
+
+use api_client::{ApiClient, ReceiveEmailRequest};
+use email_parser::ParsedEmail;
+
 #[derive(Deserialize, Clone)]
 struct Config {
     network: NetworkConfig,
@@ -29,7 +35,7 @@ struct StorageConfig {
     incoming: String,
 }
 
-fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
+fn init_logger() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Detect if running in a container or Kubernetes
     let in_container = env::var("KUBERNETES_SERVICE_HOST").is_ok()
         || env::var("DOCKER_CONTAINER").is_ok()
@@ -124,7 +130,7 @@ fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load .env file first (before logger initialization)
     let _ = dotenv::dotenv();
 
@@ -132,6 +138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logger()?;
 
     info!("🚀 Starting Restmail Receiver");
+
+    // Check API mode
+    if is_api_mode_enabled() {
+        info!("✅ API mode: ENABLED (will use REST API for validation and storage)");
+        println!("✅ API mode: ENABLED");
+        println!("   API URL: {}", env::var("REST_API_URL").unwrap_or_else(|_| "not set".to_string()));
+    } else {
+        warn!("⚠️  API mode: DISABLED (using fallback mode - accepts @restmail.org only)");
+        println!("⚠️  API mode: DISABLED");
+        println!("   Running in fallback mode (accepts @restmail.org, saves to file only)");
+        println!("   To enable API mode, set: REST_API_SERVICE_KEY and REST_API_SECRET_KEY");
+    }
 
     // 1. Last konfigurasjon
     let config = load_config();
@@ -247,14 +265,23 @@ async fn handle_policy(socket: TcpStream) -> std::io::Result<()> {
     while reader.read_line(&mut line).await? > 0 {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            let response = if recipient.ends_with("@restmail.org") {
-                info!("Policy check: ACCEPTED for recipient: {}", recipient);
-                "action=OK\n\n"
-            } else {
-                warn!("Policy check: REJECTED for recipient: {}", recipient);
-                "action=REJECT Domene ikke støttet\n\n"
+            // Check recipient via API
+            let response = match check_recipient_policy(&recipient).await {
+                Ok(true) => {
+                    info!("Policy check: ACCEPTED for recipient: {}", recipient);
+                    "action=OK\n\n"
+                }
+                Ok(false) => {
+                    warn!("Policy check: REJECTED for recipient: {}", recipient);
+                    "action=REJECT Email address not found\n\n"
+                }
+                Err(e) => {
+                    error!("Policy check error for {}: {}", recipient, e);
+                    // On error, reject to be safe
+                    "action=DEFER_IF_PERMIT Service temporarily unavailable\n\n"
+                }
             };
-            // Skriv via reader.get_mut()
+
             reader.get_mut().write_all(response.as_bytes()).await?;
             break;
         }
@@ -265,6 +292,126 @@ async fn handle_policy(socket: TcpStream) -> std::io::Result<()> {
         line.clear();
     }
     Ok(())
+}
+
+/// Check if recipient is valid via API or fallback mode
+async fn check_recipient_policy(recipient: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    // Check if API mode is enabled
+    if !is_api_mode_enabled() {
+        // Fallback mode: Accept all @restmail.org emails
+        debug!("API mode disabled, using fallback policy (accept @restmail.org)");
+        return Ok(recipient.ends_with("@restmail.org"));
+    }
+
+    // Get API client
+    let api_client = match get_api_client() {
+        Some(client) => client,
+        None => {
+            warn!("API credentials not configured, falling back to simple policy");
+            return Ok(recipient.ends_with("@restmail.org"));
+        }
+    };
+
+    // Extract domain from email
+    let domain = ParsedEmail::extract_domain(recipient)
+        .ok_or("Invalid email format")?;
+
+    // 1. Check if domain exists and is active
+    match api_client.lookup_domain(&domain).await {
+        Ok(domain_response) => {
+            if !domain_response.exists || !domain_response.is_active {
+                debug!("Domain {} not found or inactive", domain);
+                return Ok(false);
+            }
+        }
+        Err(e) => {
+            error!("Domain lookup failed: {} - falling back to accept", e);
+            // On API error, accept to avoid blocking legitimate mail
+            return Ok(true);
+        }
+    }
+
+    // 2. Check if email exists (with plus addressing support)
+    match api_client.lookup_email(recipient).await {
+        Ok(email_response) => {
+            if email_response.exists {
+                debug!("Email {} exists", recipient);
+                return Ok(true);
+            }
+        }
+        Err(e) => {
+            error!("Email lookup failed: {} - falling back to accept", e);
+            return Ok(true);
+        }
+    }
+
+    // 3. Check if it's an alias
+    match api_client.lookup_alias(recipient).await {
+        Ok(alias_response) => {
+            if alias_response.is_alias {
+                debug!("Email {} is an alias", recipient);
+                return Ok(true);
+            }
+        }
+        Err(e) => {
+            error!("Alias lookup failed: {} - falling back to accept", e);
+            return Ok(true);
+        }
+    }
+
+    // Email not found
+    Ok(false)
+}
+
+/// Get API client from environment variables (returns None if not configured)
+fn get_api_client() -> Option<ApiClient> {
+    let base_url = env::var("REST_API_URL").ok()?;
+    let service_key = env::var("REST_API_SERVICE_KEY").ok()?;
+    let secret_key = env::var("REST_API_SECRET_KEY").ok()?;
+
+    Some(ApiClient::new(base_url, service_key, secret_key))
+}
+
+/// Check if API mode is enabled
+fn is_api_mode_enabled() -> bool {
+    env::var("REST_API_SERVICE_KEY").is_ok()
+        && env::var("REST_API_SECRET_KEY").is_ok()
+}
+
+/// Send email to API (returns None if API mode disabled)
+async fn send_email_to_api(
+    email: ParsedEmail,
+    file_path: String,
+) -> Option<api_client::ReceiveEmailResponse> {
+    // Check if API mode is enabled
+    if !is_api_mode_enabled() {
+        debug!("API mode disabled, skipping API delivery");
+        return None;
+    }
+
+    let api_client = get_api_client()?;
+
+    let request = ReceiveEmailRequest {
+        from: email.from.clone(),
+        to: email.to.clone(),
+        cc: email.cc.clone(),
+        bcc: email.bcc.clone(),
+        subject: email.subject.clone(),
+        body_text: email.body_text.clone(),
+        body_html: email.body_html.clone(),
+        headers: Some(serde_json::to_value(&email.headers).ok()?),
+        attachments: Vec::new(), // TODO: Parse attachments
+    };
+
+    debug!("Sending email to API: from={}, to={:?}", request.from, request.to);
+
+    match api_client.receive_email(request).await {
+        Ok(response) => Some(response),
+        Err(e) => {
+            error!("API delivery failed: {}", e);
+            None
+        }
+    }
 }
 
 // --- PORT 2525: SMTP DELIVERY ---
@@ -289,30 +436,69 @@ async fn handle_mail_delivery(socket: TcpStream, config: Config) -> std::io::Res
 
         if in_data_mode {
             if trimmed == "." {
+                // Parse email data
+                let parsed_email = ParsedEmail::parse_from_data(&email_data);
+
+                // Save to file (backup/original copy)
                 let id = Uuid::new_v4();
                 let timestamp = Local::now().format("%Y%m%d_%H%M%S");
                 let file_name = format!("{}_{}.eml", timestamp, id);
-
-                // SLÅ SAMMEN STIER: f.eks. "/var/mail/restmail" + "incoming"
                 let full_path = Path::new(&config.storage.base_path).join(&config.storage.incoming);
-                let file_path = full_path.join(file_name);
+                let file_path = full_path.join(&file_name);
 
-                // Sørg for at hele stien eksisterer
+                // Ensure directory exists
                 if let Err(e) = fs::create_dir_all(&full_path) {
                     error!("Failed to create directory {:?}: {}", full_path, e);
-                    eprintln!("❌ Feil ved opprettelse av mappe {:?}: {}", full_path, e);
                 }
 
-                match tokio::fs::write(&file_path, &email_data).await {
+                // Save original .eml file
+                let file_saved = match tokio::fs::write(&file_path, &email_data).await {
                     Ok(_) => {
-                        info!("Mail saved successfully: from={}, to={}, file={:?}", mail_from, rcpt_to, file_path);
-                        println!("📧 Mail suksessfullt lagret i: {:?}", file_path);
-                        reader.get_mut().write_all(b"250 2.0.0 Ok: Queued\r\n").await?;
-                    },
+                        info!("Mail file saved: {:?}", file_path);
+                        true
+                    }
                     Err(e) => {
                         error!("Failed to write mail file {:?}: {}", file_path, e);
-                        eprintln!("❌ Kunne ikke skrive fil til {:?}: {}", file_path, e);
-                        reader.get_mut().write_all(b"451 4.3.0 Error: Could not write file\r\n").await?;
+                        false
+                    }
+                };
+
+                // Send to API for database storage
+                match send_email_to_api(parsed_email, file_path.to_string_lossy().to_string()).await {
+                    Some(response) => {
+                        let success_count = response.delivered_to.iter().filter(|r| r.success).count();
+                        let total = response.delivered_to.len();
+
+                        info!(
+                            "Email processed via API: {} ({}/{} recipients)",
+                            response.message, success_count, total
+                        );
+
+                        if success_count == total {
+                            println!("✅ Email delivered to {}/{} recipients via API", success_count, total);
+                            reader.get_mut().write_all(b"250 2.0.0 Ok: Queued\r\n").await?;
+                        } else if success_count > 0 {
+                            println!("⚠️  Email partially delivered: {}/{} recipients", success_count, total);
+                            reader.get_mut().write_all(b"250 2.0.0 Ok: Partially queued\r\n").await?;
+                        } else {
+                            error!("Email delivery failed for all recipients");
+                            if file_saved {
+                                reader.get_mut().write_all(b"250 2.0.0 Ok: Queued (file only)\r\n").await?;
+                            } else {
+                                reader.get_mut().write_all(b"550 5.1.1 Delivery failed\r\n").await?;
+                            }
+                        }
+                    }
+                    None => {
+                        // API mode disabled or failed
+                        if file_saved {
+                            info!("Email saved to file (API mode disabled or unavailable)");
+                            println!("📧 Mail saved to file: {:?}", file_path);
+                            reader.get_mut().write_all(b"250 2.0.0 Ok: Queued\r\n").await?;
+                        } else {
+                            error!("Failed to save email");
+                            reader.get_mut().write_all(b"451 4.3.0 Error: Could not save email\r\n").await?;
+                        }
                     }
                 }
 

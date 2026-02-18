@@ -57,6 +57,18 @@ spec:
           value: "/var/mail/restmail"
         - name: RESTMAIL_STORAGE_INCOMING
           value: "incoming"
+        - name: REST_API_URL
+          value: "http://restmail-api-service:8080"
+        - name: REST_API_SERVICE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: restmail-secrets
+              key: service-key
+        - name: REST_API_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: restmail-secrets
+              key: secret-key
         ports:
         - containerPort: 2525
           name: delivery
